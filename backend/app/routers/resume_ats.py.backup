@@ -1,0 +1,101 @@
+import os, re
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, Body
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from app.auth.dependencies import require_roles
+from app.database import get_db
+from app.models import User, CandidateProfile
+from app.services.file_service import save_upload
+
+router = APIRouter(prefix="/resume", tags=["Resume & ATS"])
+
+
+class ResumeAnalyzeRequest(BaseModel):
+    """Request body for the ATS resume analyzer endpoint."""
+    text: str
+    job_description: str | None = None
+
+
+@router.post("")
+def upload_resume(
+    file: UploadFile = File(...),
+    user: User = Depends(require_roles("candidate")),
+    db: Session = Depends(get_db),
+):
+    if file.content_type != "application/pdf":
+        raise HTTPException(400, "Resume must be a PDF")
+    path, checksum, size, name = save_upload(
+        file, "storage/resumes", int(os.getenv("MAX_UPLOAD_MB", "25"))
+    )
+    p = db.query(CandidateProfile).filter_by(user_id=user.id).first()
+    if not p:
+        p = CandidateProfile(user_id=user.id)
+        db.add(p)
+    p.resume_url = f"/{path}"
+    p.resume_filename = file.filename or name
+    p.resume_checksum = checksum
+    db.commit()
+    return {
+        "filename": p.resume_filename,
+        "url": p.resume_url,
+        "checksum": checksum,
+        "size_bytes": size,
+    }
+
+
+@router.post("/analyze")
+def analyze_resume(
+    body: ResumeAnalyzeRequest,
+    user: User = Depends(require_roles("candidate")),
+):
+    """
+    ATS keyword/skill analysis against a resume text.
+    Text is passed in the request body (not a query parameter) to avoid
+    URL length limits when processing full resume documents.
+
+    This is a deterministic rule-based analyzer — not an AI scoring model.
+    It does NOT make hiring decisions and does NOT verify skills automatically.
+    """
+    text = body.text
+    keywords = [
+        "python", "java", "javascript", "typescript", "react", "next.js",
+        "node.js", "express", "sql", "fastapi", "mongodb", "postgresql",
+        "git", "docker", "kubernetes", "aws", "azure", "machine learning",
+        "ai", "genai", "tailwind", "html", "css", "graphql",
+    ]
+    found = [k for k in keywords if re.search(re.escape(k), text, re.I)]
+    missing = [k for k in keywords if k not in found]
+    score = round(len(found) / len(keywords) * 100, 2)
+
+    result = {
+        "ats_score": score,
+        "matched_keywords": found,
+        "missing_keywords": missing,
+        "recommendation": (
+            "Add measurable project outcomes and missing role-relevant skills."
+        ),
+        "ai_note": (
+            "This is a deterministic rule-based analyzer. "
+            "ATS-detected skills remain UNVERIFIED until confirmed through "
+            "assessment or approved evidence."
+        ),
+    }
+
+    # Optional: score against provided job description keywords
+    if body.job_description:
+        jd_keywords = [
+            k for k in keywords
+            if re.search(re.escape(k), body.job_description, re.I)
+        ]
+        jd_matched = [k for k in jd_keywords if k in found]
+        jd_missing = [k for k in jd_keywords if k not in found]
+        jd_score = round(len(jd_matched) / len(jd_keywords) * 100, 2) if jd_keywords else 0.0
+        result["jd_comparison"] = {
+            "jd_keywords": jd_keywords,
+            "matched": jd_matched,
+            "missing": jd_missing,
+            "jd_match_score": jd_score,
+        }
+
+    return result
+
